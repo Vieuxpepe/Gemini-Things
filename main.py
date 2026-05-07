@@ -54,6 +54,7 @@ class ScoredTrigger:
     ticker: str
     confidence: float
     matched_keywords: Tuple[str, ...]
+    heatmap_boost: bool = False
 
 
 def score_message(text: str, keywords: tuple[str, ...], min_confidence: float) -> Optional[ScoredTrigger]:
@@ -77,32 +78,74 @@ def score_message(text: str, keywords: tuple[str, ...], min_confidence: float) -
     return ScoredTrigger(ticker=tickers[0].upper(), confidence=conf, matched_keywords=matched)
 
 
-def trigger_physical_reward(profit_amount: float) -> None:
+class SerialRewardClient:
     """
-    Opens a serial connection and sends a PULSE payload to an ESP32.
-    Intended to be called only on realized profitable trade closes.
+    Persistent serial client to avoid per-trade COM port handshake latency.
+
+    Marc-Antoine / Gemini Engineering Notes
+    --------------------------------------
+    - Serial IO must never block or crash the trading loop.
+    - Keep writes short, newline-delimited, and tolerant of disconnects.
     """
-    cfg = load_serial_reward_config()
-    if not cfg.enabled:
-        return
-    payload = {"command": "PULSE", "torque": 50, "profit": float(profit_amount)}
-    data = (json.dumps(payload) + "\n").encode("utf-8")
 
-    try:
-        with serial.Serial(
-            port=cfg.port,
-            baudrate=cfg.baudrate,
-            timeout=0.2,
-            write_timeout=cfg.write_timeout_s,
-        ) as ser:
-            ser.write(data)
-            ser.flush()
-    except Exception:
-        # Never let serial errors crash the trading loop.
-        return
+    def __init__(self) -> None:
+        self._cfg = load_serial_reward_config()
+        self._ser: Optional[serial.Serial] = None
+        self._lock = asyncio.Lock()
+
+    async def open(self) -> None:
+        if not self._cfg.enabled:
+            return
+        if self._ser and self._ser.is_open:
+            return
+        try:
+            self._ser = serial.Serial(
+                port=self._cfg.port,
+                baudrate=self._cfg.baudrate,
+                timeout=0.2,
+                write_timeout=self._cfg.write_timeout_s,
+            )
+        except Exception:
+            self._ser = None
+
+    async def close(self) -> None:
+        if self._ser is None:
+            return
+        try:
+            self._ser.close()
+        except Exception:
+            pass
+        finally:
+            self._ser = None
+
+    async def send_pulse(self, profit_amount: float) -> None:
+        await self._send({"command": "PULSE", "torque": 50, "profit": float(profit_amount)})
+
+    async def send_overload(self, duration_ms: int = 5000) -> None:
+        await self._send({"command": "OVERLOAD", "duration": int(duration_ms)})
+
+    async def _send(self, payload: dict) -> None:
+        if not self._cfg.enabled:
+            return
+        async with self._lock:
+            if self._ser is None or not self._ser.is_open:
+                await self.open()
+            if self._ser is None or not self._ser.is_open:
+                return
+            try:
+                data = (json.dumps(payload) + "\n").encode("utf-8")
+                self._ser.write(data)
+                self._ser.flush()
+            except Exception:
+                # Treat any error as a disconnect; next call will attempt reopen.
+                try:
+                    self._ser.close()
+                except Exception:
+                    pass
+                self._ser = None
 
 
-async def handle_signal(trader: ExchangeTrader, sig: TelegramSignal) -> None:
+async def handle_signal(trader: ExchangeTrader, rewards: SerialRewardClient, sig: TelegramSignal) -> None:
     strat = load_strategy_config()
     scored = score_message(sig.text, tuple(strat.keywords), strat.min_confidence)
     if not scored:
@@ -110,28 +153,29 @@ async def handle_signal(trader: ExchangeTrader, sig: TelegramSignal) -> None:
 
     ex_cfg = load_exchange_config()
 
-    # Allocation is capped again inside trader using config max limit.
-    allocation_fraction = 0.50  # user-specified intent, but config enforces safer maximum by default.
+    # Heatmap: if three distinct channels mention the same ticker within 500ms,
+    # boost confidence to 1.0 (still subject to allocation caps and stop-loss).
+    confidence = 1.0 if getattr(sig, "heatmap_boost", False) else scored.confidence
 
     try:
-        buy, sell = await trader.market_buy_then_sell(
+        buy, sell = await trader.execute_trade(
             ticker=scored.ticker,
             hold_seconds=strat.hold_seconds,
-            allocation_fraction=allocation_fraction,
+            confidence_score=confidence,
         )
     except Exception:
         return
 
-    # In a real system, compute PnL from fills + fees + position sizing.
-    # Here we trigger the reward only if we can positively determine realized profit.
     if ex_cfg.dry_run:
         return
 
-    # Placeholder: Without exchange-specific fill reconciliation, we cannot safely compute realized PnL.
-    # If you want, we can add a proper PnL calculator using order fills / trades history per exchange.
-    realized_profit = None
-    if realized_profit is not None and realized_profit > 0:
-        trigger_physical_reward(realized_profit)
+    realized_profit = sell.pnl_quote
+    if realized_profit is None or realized_profit <= 0:
+        return
+
+    await rewards.send_pulse(realized_profit)
+    if realized_profit > 10.0:
+        await rewards.send_overload(duration_ms=5000)
 
 
 async def main() -> None:
@@ -140,14 +184,17 @@ async def main() -> None:
 
     scraper = TelegramScraper(tg_cfg)
     trader = ExchangeTrader(ex_cfg)
+    rewards = SerialRewardClient()
 
     await scraper.start()
+    await rewards.open()
 
     try:
         async for sig in scraper.signals():
             # Fire-and-forget with backpressure handled by scraper queue.
-            asyncio.create_task(handle_signal(trader, sig))
+            asyncio.create_task(handle_signal(trader, rewards, sig))
     finally:
+        await rewards.close()
         await trader.close()
 
 

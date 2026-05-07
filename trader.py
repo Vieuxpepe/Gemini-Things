@@ -16,11 +16,9 @@ This framework exposes a hook to apply exchange-specific parameters safely.
 from __future__ import annotations
 
 import asyncio
-import json
 import math
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import ccxt.async_support as ccxt
 
@@ -40,6 +38,14 @@ class TradeResult:
 
 
 class ExchangeTrader:
+    """
+    Marc-Antoine / Gemini Engineering Notes
+    --------------------------------------
+    - Exchange APIs are probabilistic systems: assume partial outages, timeouts, and inconsistent fields.
+    - Latency-sensitive behavior must still be bounded by safety controls (allocation caps, stop-losses).
+    - This implementation favors correctness and survivability over micro-optimizations.
+    """
+
     def __init__(self, cfg: ExchangeConfig) -> None:
         self._cfg = cfg
         self._exchange = self._build_exchange(cfg)
@@ -155,24 +161,51 @@ class ExchangeTrader:
                 # Don’t hard-fail; execution can proceed without leverage change.
                 return
 
-    async def market_buy_then_sell(
+    @staticmethod
+    def _allocation_from_confidence(confidence_score: float) -> float:
+        """
+        Confidence -> allocation fraction mapping.
+
+        Requirements:
+        - confidence 0.90 => 0.30 of available quote balance
+        - confidence 0.98+ => 0.75
+        - interpolate linearly between
+        """
+        c = float(confidence_score)
+        if c <= 0.90:
+            return 0.30
+        if c >= 0.98:
+            return 0.75
+        # Linear interpolation from (0.90, 0.30) to (0.98, 0.75)
+        t = (c - 0.90) / (0.98 - 0.90)
+        return 0.30 + t * (0.75 - 0.30)
+
+    async def execute_trade(
         self,
         ticker: str,
         hold_seconds: float,
-        allocation_fraction: float,
+        confidence_score: float,
+        *,
+        stop_loss_drawdown: float = 0.025,
+        price_poll_interval_s: float = 0.10,
     ) -> Tuple[TradeResult, TradeResult]:
         """
-        Executes a buy then sells after a fixed hold period.
+        Executes a buy then sells after a fixed hold period, with a hard stop-loss.
 
         Safety behavior:
-        - allocation_fraction is capped by config max_quote_allocation_fraction
+        - allocation fraction is derived from confidence and capped by config max_quote_allocation_fraction
         - dry_run prints simulated fills
+        - hard stop-loss: exit early if price drops by stop_loss_drawdown from entry
         """
         await self.load_markets()
         symbol = self._symbol_from_ticker(ticker)
+
+        alloc = self._allocation_from_confidence(confidence_score)
+        alloc = min(max(alloc, 0.0), self._cfg.max_quote_allocation_fraction)
+
+        # Do not auto-increase leverage in code; leverage must be explicitly configured in config/env.
         await self._maybe_set_leverage(symbol)
 
-        alloc = min(max(allocation_fraction, 0.0), self._cfg.max_quote_allocation_fraction)
         free_quote = await self.get_free_balance(self._cfg.quote_currency)
         quote_to_spend = free_quote * alloc
 
@@ -229,6 +262,7 @@ class ExchangeTrader:
             raise RuntimeError("Computed order amount <= 0.")
 
         buy_order = await self._with_retries(self._exchange.create_market_buy_order, symbol, base_amount)
+        entry_price = float(buy_order.get("average") or 0.0) or last
         buy = TradeResult(
             symbol=symbol,
             side="buy",
@@ -240,9 +274,31 @@ class ExchangeTrader:
             order_id=buy_order.get("id"),
         )
 
-        await asyncio.sleep(hold_seconds)
+        # Hard stop-loss monitoring during the hold window.
+        stop_floor = entry_price * (1.0 - float(stop_loss_drawdown))
+        deadline = asyncio.get_running_loop().time() + float(hold_seconds)
+        exited_early = False
+        while True:
+            now = asyncio.get_running_loop().time()
+            if now >= deadline:
+                break
+            await asyncio.sleep(float(price_poll_interval_s))
+            try:
+                t = await self._with_retries(self._exchange.fetch_ticker, symbol)
+                px = float(t.get("last") or t.get("close") or 0.0)
+                if px > 0 and px <= stop_floor:
+                    exited_early = True
+                    break
+            except Exception:
+                # If price polling fails transiently, continue the hold window.
+                continue
 
         sell_order = await self._with_retries(self._exchange.create_market_sell_order, symbol, base_amount)
+        buy_cost = float(buy_order.get("cost") or quote_to_spend)
+        sell_cost = float(sell_order.get("cost") or 0.0)
+        buy_fee = float((buy_order.get("fee") or {}).get("cost") or 0.0)
+        sell_fee = float((sell_order.get("fee") or {}).get("cost") or 0.0)
+        realized = (sell_cost - sell_fee) - (buy_cost + buy_fee)
         sell = TradeResult(
             symbol=symbol,
             side="sell",
@@ -250,8 +306,30 @@ class ExchangeTrader:
             avg_price=sell_order.get("average"),
             cost=sell_order.get("cost"),
             fee=(sell_order.get("fee") or {}).get("cost"),
-            pnl_quote=None,
+            pnl_quote=realized,
             order_id=sell_order.get("id"),
         )
         return buy, sell
+
+    async def market_buy_then_sell(
+        self,
+        ticker: str,
+        hold_seconds: float,
+        allocation_fraction: float,
+    ) -> Tuple[TradeResult, TradeResult]:
+        """
+        Backwards-compatible wrapper retained for older callers.
+        """
+        # Map legacy allocation fraction into a pseudo-confidence in [0.90, 0.98].
+        # This keeps behavior stable-ish while callers migrate to execute_trade().
+        alloc = min(max(float(allocation_fraction), 0.0), 1.0)
+        # Invert the interpolation approximately:
+        if alloc <= 0.30:
+            c = 0.90
+        elif alloc >= 0.75:
+            c = 0.98
+        else:
+            t = (alloc - 0.30) / (0.75 - 0.30)
+            c = 0.90 + t * (0.98 - 0.90)
+        return await self.execute_trade(ticker=ticker, hold_seconds=hold_seconds, confidence_score=c)
 
