@@ -1,6 +1,6 @@
 ccxt==4.5.5
 websockets==15.0.1
 Telethon==1.40.0
-pandas==2.3.0
-numpy==2.3.0
+pandas==2.2.3
+numpy==2.2.6
 pyserial==3.5
